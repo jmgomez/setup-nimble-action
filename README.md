@@ -22,6 +22,22 @@ steps:
 `repo-token` is used for [Rate limiting](https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting).
 It works without setting this parameter, but please set it if you get rate limit errors.
 
+### Pin to a commit or branch
+
+`nimble-version` also accepts a commit SHA or a branch name from
+[nim-lang/nimble](https://github.com/nim-lang/nimble). These are built from
+source: expect a few minutes on a cold cache (the result is cached per commit),
+and a Nim compiler is downloaded for the build unless `nim` is already on `PATH`.
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: nim-lang/setup-nimble-action@v1
+    with:
+      nimble-version: 'a1b471d13d173897942f99d013f4efb79913bdf2' # or a branch, e.g. 'master'
+      repo-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
 ### Setup latest version
 
 ```yaml
