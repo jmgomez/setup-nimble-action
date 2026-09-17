@@ -6,8 +6,11 @@ author: 'jmgomez'
 inputs:
   nimble-version:
     description: >-
-      The Nimble version to download.
-      Examples: '0.16.3', 'latest'
+      The Nimble version to install. Accepts a release version ('0.16.3'), a
+      wildcard ('0.16.x'), 'latest', 'nightly', or any commit-ish in
+      nim-lang/nimble -- a commit SHA, short SHA, branch or tag. A commit-ish is
+      built from source, which is slower than a release download but pins the
+      build reproducibly.
     default: 'latest'
     required: false
   nimble-install-directory:
@@ -54,15 +57,153 @@ runs:
         echo "$Env:GITHUB_WORKSPACE\nim-dlls" >> $Env:GITHUB_PATH
         echo "SSL_CERT_FILE=$Env:GITHUB_WORKSPACE\nim-dlls\cacert.pem" >> $Env:GITHUB_ENV
 
-    - name: Install nimble
+    # Resolution runs on its own so the resolved commit SHA is available to the
+    # cache keys below, which are evaluated before the install step runs.
+    - name: Resolve nimble version
+      id: resolve
       shell: bash
+      env:
+        NIMBLE_VERSION: ${{ inputs.nimble-version }}
+        REPO_TOKEN: ${{ inputs.repo-token }}
+        PARENT_DIR: ${{ inputs.parent-nimble-install-directory }}
+        INSTALL_DIR: ${{ inputs.nimble-install-directory }}
+        WORKSPACE: ${{ github.workspace }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
-        "${{ github.action_path }}/install_nimble.sh" \
-          --nimble-version "${{ inputs.nimble-version }}" \
-          --parent-nimble-install-directory "${{ inputs.parent-nimble-install-directory }}" \
-          --nimble-install-directory "${{ inputs.nimble-install-directory }}" \
-          --os "${{ runner.os }}" \
-          --repo-token "${{ inputs.repo-token }}"
+        "$ACTION_PATH/resolve_nimble_version.sh" \
+          --nimble-version "$NIMBLE_VERSION" \
+          --repo-token "$REPO_TOKEN"
+
+        # actions/cache is a Node action, so this must be a native path. Using
+        # $PWD here would emit an MSYS path (/d/a/...) on Windows, which it
+        # cannot resolve; github.workspace is the same directory, spelled natively.
+        parent="$PARENT_DIR"
+        if [[ "${parent}" = "" ]]; then
+          parent="$WORKSPACE"
+        fi
+        install_path="${parent}/${INSTALL_DIR}"
+        echo "install-path=${install_path}" >> "$GITHUB_OUTPUT"
+        echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+        # The cache key must cover WHERE the binary is installed, not just which
+        # commit it was built from. actions/cache stores members relative to the
+        # workspace, so restoring an archive saved from a different install
+        # directory scatters the files while still reporting a hit.
+        # sha256sum is coreutils (Linux, Git Bash), shasum is perl (macOS);
+        # neither is present everywhere, so fall back through both.
+        if command -v sha256sum > /dev/null 2>&1; then
+          path_key=$(printf '%s' "$install_path" | sha256sum | cut -c1-12)
+        elif command -v shasum > /dev/null 2>&1; then
+          path_key=$(printf '%s' "$install_path" | shasum -a 256 | cut -c1-12)
+        else
+          path_key=$(printf '%s' "$install_path" | cksum | tr -d ' ' | cut -c1-12)
+        fi
+        echo "path-key=${path_key}" >> "$GITHUB_OUTPUT"
+
+    # Only a source build is worth caching; a release download is already fast.
+    # Restore and save are separate so that a FAILED build never writes a cache
+    # entry -- actions/cache's post step runs even when the job failed, and a
+    # cached empty directory would skip the install on every later run of this SHA.
+    - name: Restore cached nimble build
+      if: steps.resolve.outputs.kind == 'source'
+      uses: actions/cache/restore@v4
+      id: cache-nimble
+      with:
+        path: ${{ steps.resolve.outputs.install-path }}/bin
+        # No restore-keys: the SHA fully determines the binary, and a partial
+        # match would restore a nimble built from a different commit.
+        key: nimble-bin-${{ runner.os }}-${{ steps.resolve.outputs.arch }}-${{ steps.resolve.outputs.path-key }}-${{ steps.resolve.outputs.sha }}
+
+    # Resolved only when a build will actually happen, so a cache hit costs no
+    # API calls against the same rate limit the resolver depends on.
+    - name: Resolve bootstrap Nim tag
+      id: nim-tag
+      if: steps.resolve.outputs.kind == 'source' && steps.cache-nimble.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REPO_TOKEN: ${{ inputs.repo-token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        tag="$("$ACTION_PATH/install_nim_bootstrap.sh" --print-tag --repo-token "$REPO_TOKEN")"
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+    # Restore and save are split for the same reason as the nimble cache: the
+    # combined action saves in its post step even after a failed job, and the
+    # key is immutable. Save is further gated on the script having actually
+    # fetched something, so a run using the user's own nim doesn't try to cache
+    # a directory that was never created.
+    - name: Restore cached bootstrap Nim
+      if: steps.resolve.outputs.kind == 'source' && steps.cache-nimble.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v4
+      id: cache-nim
+      with:
+        path: ${{ runner.temp }}/setup-nimble-bootstrap-nim
+        key: nim-boot-${{ runner.os }}-${{ steps.resolve.outputs.arch }}-${{ steps.nim-tag.outputs.tag }}
+
+    # No-ops when the user already has a nim on PATH, or when the cache restored one.
+    - name: Setup bootstrap Nim
+      id: bootstrap-nim
+      if: steps.resolve.outputs.kind == 'source' && steps.cache-nimble.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REPO_TOKEN: ${{ inputs.repo-token }}
+        ACTION_PATH: ${{ github.action_path }}
+        BOOTSTRAP_DIR: ${{ runner.temp }}/setup-nimble-bootstrap-nim
+        RUNNER_OS_NAME: ${{ runner.os }}
+        NIM_TAG: ${{ steps.nim-tag.outputs.tag }}
+      run: |
+        "$ACTION_PATH/install_nim_bootstrap.sh" \
+          --install-directory "$BOOTSTRAP_DIR" \
+          --os "$RUNNER_OS_NAME" \
+          --tag "$NIM_TAG" \
+          --repo-token "$REPO_TOKEN"
+
+    - name: Save bootstrap Nim to cache
+      if: steps.bootstrap-nim.outputs.fetched == 'true' && steps.cache-nim.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/setup-nimble-bootstrap-nim
+        key: nim-boot-${{ runner.os }}-${{ steps.resolve.outputs.arch }}-${{ steps.nim-tag.outputs.tag }}
+
+    - name: Install nimble
+      id: install
+      if: steps.resolve.outputs.kind != 'source' || steps.cache-nimble.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        NIMBLE_KIND: ${{ steps.resolve.outputs.kind }}
+        NIMBLE_RESOLVED_VERSION: ${{ steps.resolve.outputs.version }}
+        NIMBLE_SHA: ${{ steps.resolve.outputs.sha }}
+        PARENT_DIR: ${{ inputs.parent-nimble-install-directory }}
+        INSTALL_DIR: ${{ inputs.nimble-install-directory }}
+        BOOTSTRAP_DIR: ${{ runner.temp }}/setup-nimble-bootstrap-nim
+        SOURCE_DIR: ${{ runner.temp }}/setup-nimble-src
+        RUNNER_OS_NAME: ${{ runner.os }}
+      run: |
+        "$ACTION_PATH/install_nimble.sh" \
+          --kind "$NIMBLE_KIND" \
+          --nimble-version "$NIMBLE_RESOLVED_VERSION" \
+          --nimble-sha "$NIMBLE_SHA" \
+          --parent-nimble-install-directory "$PARENT_DIR" \
+          --nimble-install-directory "$INSTALL_DIR" \
+          --nim-bootstrap-directory "$BOOTSTRAP_DIR" \
+          --source-directory "$SOURCE_DIR" \
+          --os "$RUNNER_OS_NAME"
+
+    - name: Save nimble build to cache
+      if: steps.resolve.outputs.kind == 'source' && steps.cache-nimble.outputs.cache-hit != 'true' && steps.install.outcome == 'success'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.resolve.outputs.install-path }}/bin
+        key: nimble-bin-${{ runner.os }}-${{ steps.resolve.outputs.arch }}-${{ steps.resolve.outputs.path-key }}-${{ steps.resolve.outputs.sha }}
+
+    - name: Report cached nimble
+      if: steps.resolve.outputs.kind == 'source' && steps.cache-nimble.outputs.cache-hit == 'true'
+      shell: bash
+      env:
+        NIMBLE_SHA: ${{ steps.resolve.outputs.sha }}
+      run: |
+        echo "Reusing the cached nimble built from ${NIMBLE_SHA}"
 
     - name: Set PATH for Unix
       shell: bash
